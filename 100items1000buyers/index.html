@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Limited items, many buyers</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-body-tertiary">
+  <div class="container py-4">
+    <h1 class="h3 mb-3">Limited items, many buyers</h1>
+
+    <div class="row g-2 align-items-end mb-3">
+      <div class="col-auto">
+        <label class="form-label small mb-1" for="stock">Items</label>
+        <input class="form-control" id="stock" type="number" value="100" min="1" style="width: 8rem">
+      </div>
+      <div class="col-auto">
+        <label class="form-label small mb-1" for="buyers">Buyers</label>
+        <input class="form-control" id="buyers" type="number" value="1000" min="1" style="width: 8rem">
+      </div>
+      <div class="col-auto">
+        <label class="form-label small mb-1" for="spread">Arrive within (seconds)</label>
+        <input class="form-control" id="spread" type="number" value="1" min="0" step="0.1" style="width: 11rem">
+      </div>
+      <div class="col-auto" id="buttons"></div>
+    </div>
+    <div class="mb-3 small">
+      <span class="text-body-secondary me-2">Queue mode only:</span>
+      <div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" id="crash">
+        <label class="form-check-label" for="crash">Crash the worker mid-run</label>
+      </div>
+      <div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" id="recover" checked>
+        <label class="form-check-label" for="recover">Recover unfinished jobs after a crash</label>
+      </div>
+    </div>
+
+    <div class="alert" id="status"></div>
+    <div class="row row-cols-1 row-cols-md-5 g-3" id="cards"></div>
+
+    <h2 class="h5 mt-4">Results</h2>
+    <div class="table-responsive">
+      <table class="table table-sm table-striped align-middle bg-body">
+        <thead><tr id="head"></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const MODES = {
+      naive: ["No protection", "btn-outline-danger", "API reads the stock, then decrements it. Nothing stops two buyers reading the same number."],
+      lock: ["Row lock", "btn-outline-primary", "API locks the item row in MySQL. Every other buyer waits in line for the lock."],
+      cond: ["Conditional update", "btn-outline-primary", "API runs one UPDATE that only succeeds while stock is above 0."],
+      queue: ["Redis gate + queue", "btn-outline-success", "API only talks to Redis: winners are queued, the rest are rejected. Workers write to MySQL."],
+    };
+
+    const NAMES = {
+      ...Object.fromEntries(Object.entries(MODES).map(([mode, [name]]) => [mode, name])),
+      queue_crash: "Redis gate + queue, worker crash, no recovery",
+      queue_crash_recover: "Redis gate + queue, worker crash, with recovery",
+    };
+
+    const CARDS = [
+      {title: "Buyers", rows: [["Got an item", "buyers.got"], ["Sold out", "buyers.sold_out"], ["Errors", "buyers.errors"]], last: "buyers.error"},
+      {title: "API", rows: [["Received", "api.received"], ["In progress", "api.inflight"]], last: "api.last"},
+      {title: "Redis", queueOnly: true, rows: [["Stock gate", "redis.stock"], ["Order queue", "redis.queue"], ["In progress", "redis.processing"], ["Dead-letter", "redis.dead"]]},
+      {title: "Workers", queueOnly: true, rows: [["Running", "worker.alive"], ["Jobs done", "worker.done"]], last: "worker.last"},
+      {title: "MySQL", rows: [["Available", "mysql.available"], ["Reserved", "mysql.reserved"], ["Orders", "mysql.orders"], ["Oversold", "mysql.oversold"]]},
+    ];
+
+    const COLS = [
+      ["Mode", r => NAMES[r.mode]], ["Items", "stock"], ["Buyers", "buyers"], ["Arrive within (s)", "spread"],
+      ["Got an item", "got"], ["Sold out", "sold_out"], ["Errors", "errors"],
+      ["Orders in MySQL", "orders"], ["Oversold", "oversold"], ["Lost orders", "lost"],
+      ["All answered (s)", "responded_s"], ["All saved (s)", "saved_s"],
+      ["Typical wait (ms)", "p50_ms"], ["Slowest 1% (ms)", "p99_ms"],
+    ];
+
+    const $ = id => document.getElementById(id);
+    const get = (obj, path) => path.split(".").reduce((o, k) => o?.[k], obj);
+
+    $("buttons").innerHTML = Object.entries(MODES)
+      .map(([mode, [name, cls]]) => `<button class="btn ${cls} me-1" onclick="run('${mode}')">${name}</button>`).join("");
+
+    $("cards").innerHTML = CARDS.map(c => `
+      <div class="col"><div class="card h-100 ${c.queueOnly ? "queue-only" : ""}">
+        <div class="card-header fw-semibold">${c.title}</div>
+        <ul class="list-group list-group-flush">
+          ${c.rows.map(([label, key]) => `
+            <li class="list-group-item d-flex justify-content-between">
+              <span>${label}</span><span class="fw-bold" data-key="${key}">-</span>
+            </li>`).join("")}
+        </ul>
+        ${c.last ? `<div class="card-footer small text-body-secondary" data-key="${c.last}"></div>` : ""}
+      </div></div>`).join("");
+
+    $("head").innerHTML = COLS.map(([label]) => `<th>${label}</th>`).join("");
+
+    async function run(mode) {
+      const res = await fetch("/run", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          mode, stock: +$("stock").value, buyers: +$("buyers").value, spread: +$("spread").value,
+          crash: $("crash").checked, recover: $("recover").checked,
+        }),
+      });
+      if (!res.ok) alert((await res.json()).detail);
+      tick();
+    }
+
+    async function tick() {
+      const s = await (await fetch("/stats")).json();
+
+      document.querySelectorAll("[data-key]").forEach(el => {
+        el.textContent = get(s, el.dataset.key) ?? "-";
+        el.classList.toggle("text-danger", el.dataset.key === "mysql.oversold" && s.mysql.oversold > 0);
+        if (el.classList.contains("card-footer")) el.classList.toggle("d-none", !el.textContent);
+      });
+      document.querySelectorAll(".queue-only").forEach(el => el.classList.toggle("opacity-25", !!s.mode && s.mode !== "queue"));
+      document.querySelectorAll("#buttons button").forEach(b => b.disabled = s.running);
+
+      const status = $("status");
+      if (s.mode === "queue" && s.running && !s.worker.alive) {
+        status.className = "alert alert-warning";
+        status.textContent = "No worker is running, so the queue is not being processed. Start one with: python worker.py";
+      } else if (s.mode) {
+        status.className = "alert " + (s.running ? "alert-info" : "alert-secondary");
+        status.textContent = `${s.running ? "Running" : "Finished"}: ${MODES[s.mode][0]}. ${MODES[s.mode][2]}`;
+      } else {
+        status.className = "alert alert-secondary";
+        status.textContent = "Pick a mode to send the buyers.";
+      }
+
+      $("rows").innerHTML = Object.keys(NAMES).filter(m => s.results[m]).map(m => {
+        const r = s.results[m];
+        return `<tr>${COLS.map(([, col]) => {
+          const value = typeof col === "function" ? col(r) : r[col];
+          const bad = (col === "oversold" || col === "lost") && value > 0;
+          return `<td class="${bad ? "text-danger fw-bold" : ""}">${value ?? "-"}</td>`;
+        }).join("")}</tr>`;
+      }).join("");
+    }
+
+    tick();
+    setInterval(tick, 300);
+  </script>
+</body>
+</html>
